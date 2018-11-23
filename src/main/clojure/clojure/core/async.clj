@@ -19,17 +19,15 @@ the Java system property `clojure.core.async.pool-size`."
             [clojure.core.async.impl.buffers :as buffers]
             [clojure.core.async.impl.timers :as timers]
             [clojure.core.async.impl.dispatch :as dispatch]
-            [clojure.core.async.impl.ioc-macros :as ioc]
             [clojure.core.async.impl.mutex :as mutex]
             [clojure.core.async.impl.concurrent :as conc]
-            )
+            [cloroutine.core :refer [cr]])
   (:import [java.util.concurrent.locks Lock]
            [java.util.concurrent Executors Executor ThreadLocalRandom]
-           [java.util ArrayList]))
+           [java.util ArrayList]
+           (clojure.lang Var IFn IDeref)))
 
 (alias 'core 'clojure.core)
-
-(set! *warn-on-reflection* false)
 
 (defn fn-handler
   ([f]
@@ -45,6 +43,8 @@ the Java system property `clojure.core.async.pool-size`."
      (blockable? [_] blockable)
      (lock-id [_] 0)
      (commit [_] f))))
+
+(def ^ThreadLocal fiber (ThreadLocal.))
 
 (defn buffer
   "Returns a fixed buffer of size n. When full, puts will block/park."
@@ -117,7 +117,9 @@ the Java system property `clojure.core.async.pool-size`."
   "takes a val from port. Must be called inside a (go ...) block. Will
   return nil if closed. Will park if nothing is available."
   [port]
-  (assert nil "<! used not in (go ...) block"))
+  (let [f (.get fiber)]
+    (assert f "<! used not in (go ...) block")
+    (impl/take! port f)))
 
 (defn take!
   "Asynchronously takes a val from port, passing to fn1. Will pass nil
@@ -149,7 +151,9 @@ the Java system property `clojure.core.async.pool-size`."
   inside a (go ...) block. Will park if no buffer space is available.
   Returns true unless port is already closed."
   [port val]
-  (assert nil ">! used not in (go ...) block"))
+  (let [f (.get fiber)]
+    (assert f ">! used not in (go ...) block")
+    (impl/put! port val f)))
 
 (defn- nop [_])
 (def ^:private fhnop (fn-handler nop))
@@ -297,7 +301,9 @@ the Java system property `clojure.core.async.pool-size`."
   depended upon for side effects."
 
   [ports & {:as opts}]
-  (assert nil "alts! used not in (go ...) block"))
+  (let [f (.get fiber)]
+    (assert f "alts! used not in (go ...) block")
+    (do-alts f ports opts)))
 
 (defn do-alt [alts clauses]
   (assert (even? (count clauses)) "unbalanced clauses")
@@ -375,17 +381,6 @@ the Java system property `clojure.core.async.pool-size`."
   [& clauses]
   (do-alt `alts! clauses))
 
-(defn ioc-alts! [state cont-block ports & {:as opts}]
-  (ioc/aset-all! state ioc/STATE-IDX cont-block)
-  (when-let [cb (clojure.core.async/do-alts
-                  (fn [val]
-                    (ioc/aset-all! state ioc/VALUE-IDX val)
-                    (ioc/run-state-machine-wrapped state))
-                  ports
-                  opts)]
-    (ioc/aset-all! state ioc/VALUE-IDX @cb)
-    :recur))
-
 (defn offer!
   "Puts a val into port if it's possible to do so immediately.
    nil values are not allowed. Never blocks. Returns true if offer succeeds."
@@ -400,6 +395,39 @@ the Java system property `clojure.core.async.pool-size`."
   (let [ret (impl/take! port (fn-handler nop false))]
     (when ret @ret)))
 
+(deftype Fiber [coroutine bindings ^:unsynchronized-mutable value]
+  IDeref
+  (deref [_]
+    (let [x value]
+      (set! value nil) x))
+  Runnable
+  (run [this]
+    (let [previous-fiber (.get fiber)
+          previous-frame (Var/getThreadBindingFrame)]
+      (.set fiber this)
+      (Var/resetThreadBindingFrame bindings)
+      (try (loop []
+             (when-some [box (coroutine)]
+               (set! value @box) (recur)))
+           (finally
+             (.set fiber previous-fiber)
+             (Var/resetThreadBindingFrame previous-frame)))))
+  IFn
+  (invoke [this x]
+    (set! value x)
+    (.run this))
+  Lock
+  (lock [_])
+  (unlock [_])
+  impl/Handler
+  (active? [_] true)
+  (blockable? [_] true)
+  (lock-id [_] 0)
+  (commit [this] this))
+
+(defn resume []
+  @(.get fiber))
+
 (defmacro go
   "Asynchronously executes the body, returning immediately to the
   calling thread. Additionally, any visible calls to <!, >! and alt!/alts!
@@ -411,18 +439,17 @@ the Java system property `clojure.core.async.pool-size`."
   Returns a channel which will receive the result of the body when
   completed"
   [& body]
-  (let [crossing-env (zipmap (keys &env) (repeatedly gensym))]
-    `(let [c# (chan 1)
-           captured-bindings# (clojure.lang.Var/getThreadBindingFrame)]
-       (dispatch/run
-         (^:once fn* []
-          (let [~@(mapcat (fn [[l sym]] [sym `(^:once fn* [] ~(vary-meta l dissoc :tag))]) crossing-env)
-                f# ~(ioc/state-machine `(do ~@body) 1 [crossing-env &env] ioc/async-custom-terminators)
-                state# (-> (f#)
-                           (ioc/aset-all! ioc/USER-START-IDX c#
-                                          ioc/BINDINGS-IDX captured-bindings#))]
-            (ioc/run-state-machine-wrapped state#))))
-       c#)))
+  `(let [port# (chan)]
+     (dispatch/run
+       (->Fiber
+         (cr {<!    resume
+              >!    resume
+              alts! resume}
+           (try (when-some [x# (do ~@body)]
+                  (put! port# x#) nil)
+                (finally (close! port#))))
+         (Var/getThreadBindingFrame) nil))
+     port#))
 
 (defonce ^:private ^Executor thread-macro-executor
   (Executors/newCachedThreadPool (conc/counted-thread-factory "async-thread-macro-%d" true)))
@@ -433,10 +460,10 @@ the Java system property `clojure.core.async.pool-size`."
   f when completed, then close."
   [f]
   (let [c (chan 1)]
-    (let [binds (clojure.lang.Var/getThreadBindingFrame)]
+    (let [binds (Var/getThreadBindingFrame)]
       (.execute thread-macro-executor
                 (fn []
-                  (clojure.lang.Var/resetThreadBindingFrame binds)
+                  (Var/resetThreadBindingFrame binds)
                   (try
                     (let [ret (f)]
                       (when-not (nil? ret)

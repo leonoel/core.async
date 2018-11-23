@@ -5,9 +5,33 @@
               [cljs.core.async.impl.buffers :as buffers]
               [cljs.core.async.impl.timers :as timers]
               [cljs.core.async.impl.dispatch :as dispatch]
-              [cljs.core.async.impl.ioc-helpers :as helpers])
-    (:require-macros [cljs.core.async.impl.ioc-macros :as ioc]
-                     [cljs.core.async :refer [go go-loop]]))
+              [cloroutine.core])
+    (:require-macros [cljs.core.async :refer [go go-loop]]))
+
+(def ^:dynamic *fiber*)
+
+(defn resume [] @*fiber*)
+
+(deftype Fiber [coroutine ^:mutable value]
+  IDeref
+  (-deref [_]
+    (let [x value]
+      (set! value nil) x))
+
+  IFn
+  (-invoke [this]
+    (binding [*fiber* this]
+      (loop []
+        (when-some [box (coroutine)]
+          (set! value @box) (recur)))))
+  (-invoke [this x]
+    (set! value x)
+    (this))
+  
+  impl/Handler
+  (active? [_] true)
+  (blockable? [_] true)
+  (commit [this] this))
 
 (defn- fn-handler
   ([f] (fn-handler f true))
@@ -85,7 +109,9 @@
   return nil if closed. Will park if nothing is available.
   Returns true unless port is already closed"
   [port]
-  (throw (js/Error. "<! used not in (go ...) block")))
+  (let [f *fiber*]
+    (assert f "<! used not in (go ...) block")
+    (impl/take! port f)))
 
 (defn take!
   "Asynchronously takes a val from port, passing to fn1. Will pass nil
@@ -110,7 +136,9 @@
   inside a (go ...) block. Will park if no buffer space is available.
   Returns true unless port is already closed."
   [port val]
-  (throw (js/Error. ">! used not in (go ...) block")))
+  (let [f *fiber*]
+    (assert f ">! used not in (go ...) block")
+    (impl/put! port val f)))
 
 (defn put!
   "Asynchronously puts a val into port, calling fn1 (if supplied) when
@@ -219,7 +247,9 @@
   depended upon for side effects."
 
   [ports & {:as opts}]
-  (throw (js/Error. "alts! used not in (go ...) block")))
+  (let [f *fiber*]
+    (assert f "alts! used not in (go ...) block")
+    (do-alts f ports opts)))
 
 (defn offer!
   "Puts a val into port if it's possible to do so immediately.
@@ -481,17 +511,6 @@
   (unmix-all* [m])
   (toggle* [m state-map])
   (solo-mode* [m mode]))
-
-(defn ioc-alts! [state cont-block ports & {:as opts}]
-  (ioc/aset-all! state helpers/STATE-IDX cont-block)
-  (when-let [cb (cljs.core.async/do-alts
-                  (fn [val]
-                    (ioc/aset-all! state helpers/VALUE-IDX val)
-                    (helpers/run-state-machine-wrapped state))
-                  ports
-                  opts)]
-    (ioc/aset-all! state helpers/VALUE-IDX @cb)
-    :recur))
 
 (defn mix
   "Creates and returns a mix of one or more input channels which will

@@ -1,5 +1,5 @@
 (ns cljs.core.async
-  (:require [cljs.core.async.impl.ioc-macros :as ioc]))
+  (:require [cloroutine.core :refer [cr]]))
 
 (defmacro go
   "Asynchronously executes the body, returning immediately to the
@@ -14,12 +14,12 @@
   [& body]
   `(let [c# (cljs.core.async/chan 1)]
      (cljs.core.async.impl.dispatch/run
-      (fn []
-        (let [f# ~(ioc/state-machine body 1 &env ioc/async-custom-terminators)
-              state# (-> (f#)
-                         (ioc/aset-all! cljs.core.async.impl.ioc-helpers/USER-START-IDX c#))]
-          (cljs.core.async.impl.ioc-helpers/run-state-machine-wrapped state#))))
-     c#))
+       (cljs.core.async/->Fiber
+        (cr {cljs.core.async/<!    cljs.core.async/resume
+             cljs.core.async/>!    cljs.core.async/resume
+             cljs.core.async/alts! cljs.core.async/resume}
+           (try (when-some [x# (do ~@body)] (cljs.core.async/put! c# x#) nil)
+                (finally (cljs.core.async/close! c#)))) nil)) c#))
 
 
 (defn do-alt [alts clauses]
